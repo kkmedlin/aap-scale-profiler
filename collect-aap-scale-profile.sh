@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# collect-aap-scale-profile.sh — Generate an AAP scale profile for analysis and capacity planning
+# Usage: ./collect-aap-scale-profile.sh <namespace>
+
+set -uo pipefail
+
+NAMESPACE="${1:?Usage: $0 <namespace>}"
+WORKDIR=$(mktemp -d)
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+OUTPUT_FILE="aap-scale-profile-${TIMESTAMP}.tar.gz"
+SCRIPT_VERSION="1.0.0"
+AAP_VERSION_BRANCH=""
+CONTROLLER_POD=""
+CONTROLLER_CONTAINER=""
+GATEWAY_POD=""
+GATEWAY_CONTAINER=""
+ERRORS=0
+
+trap 'rm -rf "$WORKDIR"' EXIT
+
+# ── output helpers ─────────────────────────────────────────────────────────────
+
+info()    { echo "[INFO]  $*"; }
+success() { echo "[OK]    $*"; }
+warn()    { echo "[WARN]  $*"; ERRORS=$((ERRORS + 1)); }
+die()     { echo "[ERROR] $*" >&2; exit 1; }
+
+# ── preflight ─────────────────────────────────────────────────────────────────
+
+preflight() {
+    command -v oc &>/dev/null      || die "'oc' not found. Install the OpenShift CLI and try again."
+    oc whoami &>/dev/null          || die "Not logged in to an OpenShift cluster. Run 'oc login' first."
+    oc get namespace "$NAMESPACE" &>/dev/null || die "Namespace '$NAMESPACE' not found on this cluster."
+}
+
+# ── pod discovery ─────────────────────────────────────────────────────────────
+
+discover_controller() {
+    CONTROLLER_POD=$(oc get pods -n "$NAMESPACE" 2>/dev/null \
+        | awk '/aap-controller-task.*Running/ {print $1; exit}')
+    [[ -n "$CONTROLLER_POD" ]] \
+        || die "No running aap-controller-task pod found in namespace '$NAMESPACE'."
+    CONTROLLER_CONTAINER="aap-controller-task"
+    info "Controller pod:  $CONTROLLER_POD (container: $CONTROLLER_CONTAINER)"
+}
+
+discover_gateway() {
+    GATEWAY_POD=$(oc get pods -n "$NAMESPACE" 2>/dev/null \
+        | awk '/^aap-gateway-.*Running/ && !/operator/ {print $1; exit}')
+    [[ -n "$GATEWAY_POD" ]] \
+        || die "No running aap-gateway pod found in namespace '$NAMESPACE'."
+
+    GATEWAY_CONTAINER=$(oc get pod "$GATEWAY_POD" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.containers[*].name}' 2>/dev/null \
+        | tr ' ' '\n' | grep -E '^(api|aap-gateway)$' | head -1)
+    [[ -n "$GATEWAY_CONTAINER" ]] \
+        || die "Could not determine gateway container name in pod '$GATEWAY_POD'."
+    info "Gateway pod:     $GATEWAY_POD (container: $GATEWAY_CONTAINER)"
+}
+
+# ── query runners ─────────────────────────────────────────────────────────────
+
+run_controller_query() {
+    local label="$1" sql="$2" outfile="$3" hint="${4:-}"
+    info "Collecting: $label${hint:+ ($hint)}"
+
+    if ! oc exec -i "$CONTROLLER_POD" -n "$NAMESPACE" -c "$CONTROLLER_CONTAINER" -- \
+            awx-manage dbshell <<< "$sql" > "$WORKDIR/$outfile" 2>/dev/null; then
+        warn "$label failed — pod may have restarted. Retrying with fresh pod discovery."
+        discover_controller
+        oc exec -i "$CONTROLLER_POD" -n "$NAMESPACE" -c "$CONTROLLER_CONTAINER" -- \
+            awx-manage dbshell <<< "$sql" > "$WORKDIR/$outfile" 2>/dev/null || true
+    fi
+
+    if [[ -s "$WORKDIR/$outfile" ]]; then
+        success "$label"
+    else
+        warn "$label produced no output — file will be empty in the bundle."
+        echo "ERROR: query produced no output" > "$WORKDIR/$outfile"
+    fi
+}
+
+run_gateway_query() {
+    local label="$1" sql="$2" outfile="$3"
+    local errtmp
+    errtmp=$(mktemp)
+    info "Collecting: $label"
+
+    if ! oc exec -i "$GATEWAY_POD" -n "$NAMESPACE" -c "$GATEWAY_CONTAINER" -- \
+            aap-gateway-manage dbshell <<< "$sql" > "$WORKDIR/$outfile" 2>"$errtmp"; then
+        warn "$label failed — pod may have restarted. Retrying with fresh pod discovery."
+        discover_gateway
+        oc exec -i "$GATEWAY_POD" -n "$NAMESPACE" -c "$GATEWAY_CONTAINER" -- \
+            aap-gateway-manage dbshell <<< "$sql" > "$WORKDIR/$outfile" 2>"$errtmp" || true
+    fi
+
+    if [[ -s "$WORKDIR/$outfile" ]]; then
+        success "$label"
+    else
+        warn "$label produced no output — file will be empty in the bundle."
+        if [[ -s "$errtmp" ]]; then
+            warn "  Error detail: $(grep -v '^$' "$errtmp" | tail -5)"
+            cat "$errtmp" > "$WORKDIR/$outfile"
+        else
+            echo "ERROR: query produced no output" > "$WORKDIR/$outfile"
+        fi
+    fi
+    rm -f "$errtmp"
+}
+
+# ── version detection ─────────────────────────────────────────────────────────
+
+detect_version() {
+    info "Detecting AAP version..."
+    local result
+    result=$(oc exec -i "$CONTROLLER_POD" -n "$NAMESPACE" -c "$CONTROLLER_CONTAINER" -- \
+        awx-manage dbshell \
+        <<< "SELECT CASE WHEN COUNT(*) > 0 THEN 'AAP 2.5+' ELSE 'AAP 2.4' END AS aap_version FROM django_migrations WHERE app = 'dab_rbac';" \
+        2>/dev/null)
+
+    if echo "$result" | grep -qF "AAP 2.5+"; then
+        AAP_VERSION_BRANCH="2.5+"
+    else
+        AAP_VERSION_BRANCH="2.4"
+    fi
+    info "AAP version branch: $AAP_VERSION_BRANCH"
+}
+
+# ── controller queries ────────────────────────────────────────────────────────
+
+collect_controller() {
+    echo ""
+    echo "=== Controller Queries ==="
+
+    run_controller_query "Bloat Metrics" \
+        "SELECT schemaname, relname, n_live_tup, n_dead_tup, last_vacuum, last_analyze FROM pg_stat_user_tables WHERE schemaname = 'public' ORDER BY n_dead_tup DESC;" \
+        "bloat-controller.txt"
+
+    run_controller_query "Inventory Distribution" \
+        "SELECT (SELECT COUNT(*) FROM main_organization) AS org_count, (SELECT COUNT(*) FROM main_inventory) AS inventory_count, (SELECT COUNT(*) FROM main_host) AS host_count, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY inv_count) FROM (SELECT COUNT(i.id) AS inv_count FROM main_organization o LEFT JOIN main_inventory i ON i.organization_id = o.id GROUP BY o.id) t) AS median_inventories_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY inv_count) FROM (SELECT COUNT(i.id) AS inv_count FROM main_organization o LEFT JOIN main_inventory i ON i.organization_id = o.id GROUP BY o.id) t) AS p90_inventories_per_org, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY host_count) FROM (SELECT COUNT(h.id) AS host_count FROM main_inventory i LEFT JOIN main_host h ON h.inventory_id = i.id GROUP BY i.id) t) AS median_hosts_per_inventory, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY host_count) FROM (SELECT COUNT(h.id) AS host_count FROM main_inventory i LEFT JOIN main_host h ON h.inventory_id = i.id GROUP BY i.id) t) AS p90_hosts_per_inventory;" \
+        "inventory-distribution.txt"
+
+    run_controller_query "Project Distribution" \
+        "SELECT (SELECT COUNT(*) FROM main_unifiedjobtemplate WHERE polymorphic_ctype_id IN (SELECT id FROM django_content_type WHERE app_label='main' AND model='project')) AS project_count, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY proj_count) FROM (SELECT COUNT(ujt.id) AS proj_count FROM main_organization o LEFT JOIN main_unifiedjobtemplate ujt ON ujt.organization_id = o.id AND ujt.polymorphic_ctype_id IN (SELECT id FROM django_content_type WHERE app_label='main' AND model='project') GROUP BY o.id) t) AS median_projects_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY proj_count) FROM (SELECT COUNT(ujt.id) AS proj_count FROM main_organization o LEFT JOIN main_unifiedjobtemplate ujt ON ujt.organization_id = o.id AND ujt.polymorphic_ctype_id IN (SELECT id FROM django_content_type WHERE app_label='main' AND model='project') GROUP BY o.id) t) AS p90_projects_per_org;" \
+        "project-distribution.txt"
+
+    run_controller_query "Job Template Distribution" \
+        "SELECT (SELECT COUNT(*) FROM main_jobtemplate) AS total_job_templates, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY jt_count) FROM (SELECT COUNT(jt.unifiedjobtemplate_ptr_id) AS jt_count FROM main_project p LEFT JOIN main_jobtemplate jt ON jt.project_id = p.unifiedjobtemplate_ptr_id GROUP BY p.unifiedjobtemplate_ptr_id) t) AS median_job_templates_per_project, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY jt_count) FROM (SELECT COUNT(jt.unifiedjobtemplate_ptr_id) AS jt_count FROM main_project p LEFT JOIN main_jobtemplate jt ON jt.project_id = p.unifiedjobtemplate_ptr_id GROUP BY p.unifiedjobtemplate_ptr_id) t) AS p90_job_templates_per_project, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY job_count) FROM (SELECT jt.unifiedjobtemplate_ptr_id, COALESCE(jc.job_count, 0) AS job_count FROM main_jobtemplate jt LEFT JOIN (SELECT j.job_template_id, COUNT(*) AS job_count FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '30 days' GROUP BY j.job_template_id) jc ON jc.job_template_id = jt.unifiedjobtemplate_ptr_id) t) AS median_jobs_per_template_30d, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY job_count) FROM (SELECT jt.unifiedjobtemplate_ptr_id, COALESCE(jc.job_count, 0) AS job_count FROM main_jobtemplate jt LEFT JOIN (SELECT j.job_template_id, COUNT(*) AS job_count FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '30 days' GROUP BY j.job_template_id) jc ON jc.job_template_id = jt.unifiedjobtemplate_ptr_id) t) AS p90_jobs_per_template_30d;" \
+        "job-template-distribution.txt"
+
+    run_controller_query "Job Distribution" \
+        "SELECT (SELECT COUNT(*) FROM main_job) AS total_jobs, (SELECT COUNT(*) FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '1 day') AS jobs_24h, (SELECT COUNT(*) FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '7 days') AS jobs_7d, (SELECT COUNT(*) FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '30 days') AS jobs_30d;" \
+        "job-distribution.txt"
+
+    run_controller_query "Job Events" \
+        "SELECT (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY event_count) FROM (SELECT COUNT(je.id) AS event_count FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id LEFT JOIN main_jobevent je ON je.job_id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '30 days' GROUP BY j.unifiedjob_ptr_id) t) AS median_job_events_per_job_30d, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY event_count) FROM (SELECT COUNT(je.id) AS event_count FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id LEFT JOIN main_jobevent je ON je.job_id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '30 days' GROUP BY j.unifiedjob_ptr_id) t) AS p90_job_events_per_job_30d;" \
+        "job-events.txt" \
+        "scanning 30 days of jobs, may take a little longer on large environments"
+
+    if [[ "$AAP_VERSION_BRANCH" == "2.4" ]]; then
+        run_controller_query "Controller RBAC Distribution" \
+            "SELECT COUNT(DISTINCT cr.id) AS role_definition_count, COUNT(DISTINCT cur.id) AS role_user_assignment_count, COUNT(DISTINCT ctr.id) AS role_team_assignment_count FROM controller_role cr FULL OUTER JOIN controller_user_role cur ON TRUE FULL OUTER JOIN controller_team_role ctr ON TRUE;" \
+            "controller-rbac-distribution.txt"
+    else
+        run_controller_query "Controller RBAC Distribution" \
+            "SELECT COUNT(DISTINCT re.id) AS role_evaluation_count, COUNT(DISTINCT rua.id) AS role_user_assignment_count, COUNT(DISTINCT rta.id) AS role_team_assignment_count FROM dab_rbac_roleevaluation re FULL OUTER JOIN dab_rbac_roleuserassignment rua ON TRUE FULL OUTER JOIN dab_rbac_roleteamassignment rta ON TRUE;" \
+            "controller-rbac-distribution.txt"
+    fi
+
+    run_controller_query "Database Config" \
+        "SELECT version() AS pg_version, (SELECT setting FROM pg_settings WHERE name = 'max_connections') AS max_connections, (SELECT setting FROM pg_settings WHERE name = 'work_mem') AS work_mem, (SELECT setting FROM pg_settings WHERE name = 'shared_buffers') AS shared_buffers, (SELECT setting FROM pg_settings WHERE name = 'effective_cache_size') AS effective_cache_size, (SELECT setting FROM pg_settings WHERE name = 'checkpoint_completion_target') AS checkpoint_completion_target, (SELECT setting FROM pg_settings WHERE name = 'wal_buffers') AS wal_buffers, (SELECT setting FROM pg_settings WHERE name = 'maintenance_work_mem') AS maintenance_work_mem, (SELECT setting FROM pg_settings WHERE name = 'random_page_cost') AS random_page_cost, (SELECT setting FROM pg_settings WHERE name = 'effective_io_concurrency') AS effective_io_concurrency;" \
+        "infrastructure-config.txt"
+
+    if [[ "$AAP_VERSION_BRANCH" == "2.4" ]]; then
+        run_controller_query "User/Team/Org Distribution" \
+            "SELECT (SELECT COUNT(*) FROM main_user) AS total_users, (SELECT COUNT(*) FROM main_team) AS total_teams, (SELECT COUNT(*) FROM main_organization) AS total_organizations, (SELECT COUNT(*) FROM controller_user_role) AS role_user_assignment_count, (SELECT COUNT(*) FROM controller_team_role) AS role_team_assignment_count, (SELECT COUNT(*) FROM controller_role) AS total_roles;" \
+            "user-org-distribution.txt"
+    fi
+}
+
+# ── gateway queries ───────────────────────────────────────────────────────────
+
+collect_gateway() {
+    echo ""
+    echo "=== Gateway Queries ==="
+
+    run_gateway_query "Gateway Bloat Metrics" \
+        "SELECT schemaname, relname, n_live_tup, n_dead_tup, last_vacuum, last_analyze FROM pg_stat_user_tables WHERE schemaname = 'public' ORDER BY n_dead_tup DESC;" \
+        "bloat-gateway.txt"
+
+    run_gateway_query "Gateway RBAC Distribution" \
+        "SELECT (SELECT COUNT(*) FROM aap_gateway_api_user) AS total_users, (SELECT COUNT(*) FROM aap_gateway_api_team) AS total_teams, (SELECT COUNT(*) FROM dab_rbac_roledefinition) AS total_roles, (SELECT COUNT(*) FROM aap_gateway_api_organization) AS total_organizations;" \
+        "gateway-rbac-distribution.txt"
+
+    run_gateway_query "Gateway Organization/Team Distribution" \
+        "SELECT (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY role_count) FROM (SELECT COUNT(DISTINCT rua.role_definition_id) as role_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS median_roles_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY role_count) FROM (SELECT COUNT(DISTINCT rua.role_definition_id) as role_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS p90_roles_per_org, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS median_users_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS p90_users_per_org, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY team_count) FROM (SELECT COUNT(DISTINCT t.id) as team_count FROM aap_gateway_api_organization o LEFT JOIN aap_gateway_api_team t ON t.organization_id = o.id GROUP BY o.id) t) AS median_teams_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY team_count) FROM (SELECT COUNT(DISTINCT t.id) as team_count FROM aap_gateway_api_organization o LEFT JOIN aap_gateway_api_team t ON t.organization_id = o.id GROUP BY o.id) t) AS p90_teams_per_org, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_team t LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = t.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='team') GROUP BY t.id) t2) AS median_users_per_team, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_team t LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = t.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='team') GROUP BY t.id) t2) AS p90_users_per_team;" \
+        "gateway-distribution.txt"
+}
+
+# ── metadata ──────────────────────────────────────────────────────────────────
+
+collect_metadata() {
+    info "Collecting metadata..."
+    local aap_version ocp_version node_count cluster_name
+    aap_version=$(oc get aap -n "$NAMESPACE" -o jsonpath='{.items[0].status.version}' 2>/dev/null || echo "unknown")
+    ocp_version=$(oc version -o json 2>/dev/null | jq -r '.openshiftVersion' 2>/dev/null || echo "unknown")
+    node_count=$(oc get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    cluster_name=$(oc config current-context 2>/dev/null || echo "unknown")
+    task_replicas=$(oc get aap -n "$NAMESPACE" -o jsonpath='{.items[0].spec.controller.task_replicas}' 2>/dev/null); task_replicas="${task_replicas:-unknown}"
+    web_replicas=$(oc get aap -n "$NAMESPACE" -o jsonpath='{.items[0].spec.controller.web_replicas}' 2>/dev/null); web_replicas="${web_replicas:-unknown}"
+    gateway_replicas=$(oc get aap -n "$NAMESPACE" -o jsonpath='{.items[0].spec.api.replicas}' 2>/dev/null); gateway_replicas="${gateway_replicas:-unknown}"
+
+    cat > "$WORKDIR/metadata.txt" <<EOF
+=== AAP Scale Profile Metadata ===
+Collection Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+Cluster Name: ${cluster_name}
+OpenShift Version: ${ocp_version}
+Node Count: ${node_count}
+AAP Version: ${aap_version}
+Controller Task Replicas: ${task_replicas}
+Controller Web Replicas: ${web_replicas}
+Gateway Replicas: ${gateway_replicas}
+AAP Namespace: ${NAMESPACE}
+AAP Version Branch: ${AAP_VERSION_BRANCH}
+Script Version: ${SCRIPT_VERSION}
+EOF
+    success "Metadata collected"
+}
+
+# ── bundle ────────────────────────────────────────────────────────────────────
+
+bundle() {
+    echo ""
+    info "Bundling results..."
+    tar -czf "$OUTPUT_FILE" -C "$WORKDIR" .
+    success "Bundle created: $OUTPUT_FILE"
+    echo ""
+    echo "Files included:"
+    tar -tzf "$OUTPUT_FILE" | sed 's|^\./||' | grep '\.txt$' | sort
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    echo ""
+    echo "AAP Scale Profile Collection"
+    echo "Namespace: $NAMESPACE"
+    echo "========================================"
+
+    preflight
+    discover_controller
+    detect_version
+    collect_controller
+
+    if [[ "$AAP_VERSION_BRANCH" == "2.5+" ]]; then
+        discover_gateway
+        collect_gateway
+    fi
+
+    collect_metadata
+    bundle
+
+    echo ""
+    if [[ $ERRORS -gt 0 ]]; then
+        echo "[WARN]  $ERRORS item(s) had warnings. Send the bundle to Red Hat anyway. The metadata will help diagnose."
+    else
+        echo "All queries succeeded."
+    fi
+    echo ""
+    echo -e "\033[1mOptional:\033[0m review what's included before sending."
+    echo "  List files:         tar -tzf $OUTPUT_FILE"
+    echo "  Print all files:       tar -xOzf $OUTPUT_FILE | less"
+    echo "  Print a single file:       tar -xOzf $OUTPUT_FILE ./<filename>.txt"
+    echo ""
+    echo -e "\033[1mNext step:\033[0m attach $OUTPUT_FILE to your Red Hat support case."
+    echo ""
+}
+
+main
