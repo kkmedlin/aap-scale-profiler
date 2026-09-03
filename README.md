@@ -1,6 +1,6 @@
 # AAP Scale Profiler
 
-This script profiles your AAP environment by collecting read-only aggregate metrics. It takes about 5 minutes to run. You can use the results for capacity planning, workload analysis, or optionally share with Red Hat Support.
+This script profiles your AAP environment by collecting read-only aggregate metrics. It takes about 5 minutes to run and can help with capacity planning, workload analysis, and understanding your environment's scale. Results can also be shared with Red Hat Support if needed.
 
 ---
 
