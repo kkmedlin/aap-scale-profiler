@@ -1,6 +1,6 @@
 # AAP Scale Profiler
 
-This script profiles your AAP environment by collecting read-only aggregate metrics. It takes about 5 minutes to run and can help with capacity planning, workload analysis, and understanding your environment's scale. Results can also be shared with Red Hat Support if needed.
+This script profiles your AAP environment by collecting read-only aggregate metrics. It typically takes 1–2 minutes to run and can help with capacity planning, workload analysis, and understanding your environment's scale. Results can also be shared with Red Hat Support if needed.
 
 ---
 
@@ -19,6 +19,8 @@ oc get aap -A
 ```
 
 Note the value in the NAMESPACE column. You will use it in Step 3.
+
+On AAP 2.4 the command above returns nothing. Use `oc get automationcontroller -A` instead.
 
 ---
 
@@ -87,7 +89,7 @@ The script collects **aggregate metrics only** — no names, no credentials, no 
 ✅ Collected:
 - Table bloat statistics
 - Organization, inventory, host, project, and job template counts
-- Job volume and event distribution (last 30 days)
+- Job volume (last 30 days) and event distribution (500 most recent jobs)
 - RBAC assignment counts
 - PostgreSQL configuration settings
 
@@ -108,7 +110,7 @@ Install the OpenShift CLI: https://docs.openshift.com/container-platform/latest/
 Run `oc login` with your cluster URL and credentials, then re-run the script.
 
 **"Namespace not found"**
-Verify the namespace with `oc get aap -A` and use the exact value shown.
+Verify the namespace with `oc get aap -A` (AAP 2.4: `oc get automationcontroller -A`) and use the exact value shown.
 
 **A query produced an empty file**
 The script will still create the bundle. Send it to Red Hat along with a note about which query failed.

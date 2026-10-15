@@ -50,11 +50,11 @@ oc get aap -A
 
 Note the NAMESPACE column.
 
-If the above returns no results, try:
+If the above returns no results, you are likely on AAP 2.4, which has no AnsibleAutomationPlatform resource. Use:
 ```bash
-oc get pods -A | grep aap-controller
+oc get automationcontroller -A
 ```
-Note the value in the left-side column.
+Note the NAMESPACE column.
 
 ### Find a Controller Pod
 
@@ -131,7 +131,7 @@ cd ~/aap-collection
 ```bash
 oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
   awx-manage dbshell \
-  <<< "SELECT schemaname, relname, n_live_tup, n_dead_tup, last_vacuum, last_analyze FROM pg_stat_user_tables WHERE schemaname = 'public' ORDER BY n_dead_tup DESC;" \
+  <<< "SELECT schemaname, relname, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze FROM pg_stat_user_tables WHERE schemaname = 'public' ORDER BY n_dead_tup DESC;" \
   > ./bloat-controller.txt 2>/dev/null
 ```
 
@@ -173,12 +173,12 @@ oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
 
 #### Command 6: Job Events
 
-> This query scans 30 days of job history and may take longer on large environments — this is normal.
+> This query samples the 500 most recent jobs.
 
 ```bash
 oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
   awx-manage dbshell \
-  <<< "SELECT (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY event_count) FROM (SELECT COUNT(je.id) AS event_count FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id LEFT JOIN main_jobevent je ON je.job_id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '30 days' GROUP BY j.unifiedjob_ptr_id) t) AS median_job_events_per_job_30d, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY event_count) FROM (SELECT COUNT(je.id) AS event_count FROM main_job j JOIN main_unifiedjob uj ON uj.id = j.unifiedjob_ptr_id LEFT JOIN main_jobevent je ON je.job_id = j.unifiedjob_ptr_id WHERE uj.started >= CURRENT_DATE - INTERVAL '30 days' GROUP BY j.unifiedjob_ptr_id) t) AS p90_job_events_per_job_30d;" \
+  <<< "SELECT COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY event_count), 0) AS median_job_events_per_job, COALESCE(percentile_cont(0.9) WITHIN GROUP (ORDER BY event_count), 0) AS p90_job_events_per_job FROM (SELECT uj.id, uj.created FROM main_unifiedjob uj JOIN main_job j ON j.unifiedjob_ptr_id = uj.id ORDER BY uj.id DESC LIMIT 500) j CROSS JOIN LATERAL (SELECT COUNT(*) AS event_count FROM main_jobevent je WHERE je.job_id = j.id AND je.job_created = j.created) c;" \
   > ./job-events.txt 2>/dev/null
 ```
 
@@ -190,7 +190,7 @@ Use the variant that matches your version detection result from Step 3.
 ```bash
 oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
   awx-manage dbshell \
-  <<< "SELECT COUNT(DISTINCT cr.id) AS role_definition_count, COUNT(DISTINCT cur.id) AS role_user_assignment_count, COUNT(DISTINCT ctr.id) AS role_team_assignment_count FROM controller_role cr FULL OUTER JOIN controller_user_role cur ON TRUE FULL OUTER JOIN controller_team_role ctr ON TRUE;" \
+  <<< "SELECT (SELECT COUNT(*) FROM main_rbac_roles) AS role_definition_count, (SELECT COUNT(*) FROM main_rbac_roles_members) AS role_user_assignment_count, (SELECT COUNT(*) FROM main_rbac_roles_parents p JOIN main_team t ON t.member_role_id = p.to_role_id WHERE p.from_role_id <> t.read_role_id) AS role_team_assignment_count;" \
   > ./controller-rbac-distribution.txt 2>/dev/null
 ```
 
@@ -198,7 +198,7 @@ oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
 ```bash
 oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
   awx-manage dbshell \
-  <<< "SELECT COUNT(DISTINCT re.id) AS role_evaluation_count, COUNT(DISTINCT rua.id) AS role_user_assignment_count, COUNT(DISTINCT rta.id) AS role_team_assignment_count FROM dab_rbac_roleevaluation re FULL OUTER JOIN dab_rbac_roleuserassignment rua ON TRUE FULL OUTER JOIN dab_rbac_roleteamassignment rta ON TRUE;" \
+  <<< "SELECT (SELECT COUNT(*) FROM dab_rbac_roleevaluation) AS role_evaluation_count, (SELECT COUNT(*) FROM dab_rbac_roleuserassignment) AS role_user_assignment_count, (SELECT COUNT(*) FROM dab_rbac_roleteamassignment) AS role_team_assignment_count;" \
   > ./controller-rbac-distribution.txt 2>/dev/null
 ```
 
@@ -207,7 +207,7 @@ oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
 ```bash
 oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
   awx-manage dbshell \
-  <<< "SELECT version() AS pg_version, (SELECT setting FROM pg_settings WHERE name = 'max_connections') AS max_connections, (SELECT setting FROM pg_settings WHERE name = 'work_mem') AS work_mem, (SELECT setting FROM pg_settings WHERE name = 'shared_buffers') AS shared_buffers, (SELECT setting FROM pg_settings WHERE name = 'effective_cache_size') AS effective_cache_size, (SELECT setting FROM pg_settings WHERE name = 'checkpoint_completion_target') AS checkpoint_completion_target, (SELECT setting FROM pg_settings WHERE name = 'wal_buffers') AS wal_buffers, (SELECT setting FROM pg_settings WHERE name = 'maintenance_work_mem') AS maintenance_work_mem, (SELECT setting FROM pg_settings WHERE name = 'random_page_cost') AS random_page_cost, (SELECT setting FROM pg_settings WHERE name = 'effective_io_concurrency') AS effective_io_concurrency;" \
+  <<< "SELECT version() AS pg_version, current_setting('max_connections') AS max_connections, current_setting('work_mem') AS work_mem, current_setting('shared_buffers') AS shared_buffers, current_setting('effective_cache_size') AS effective_cache_size, current_setting('checkpoint_completion_target') AS checkpoint_completion_target, current_setting('wal_buffers') AS wal_buffers, current_setting('maintenance_work_mem') AS maintenance_work_mem, current_setting('random_page_cost') AS random_page_cost, current_setting('effective_io_concurrency') AS effective_io_concurrency;" \
   > ./infrastructure-config.txt 2>/dev/null
 ```
 
@@ -218,7 +218,7 @@ If you are on AAP 2.5 or later, skip this command — that data comes from the G
 ```bash
 oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
   awx-manage dbshell \
-  <<< "SELECT (SELECT COUNT(*) FROM main_user) AS total_users, (SELECT COUNT(*) FROM main_team) AS total_teams, (SELECT COUNT(*) FROM main_organization) AS total_organizations, (SELECT COUNT(*) FROM controller_user_role) AS role_user_assignment_count, (SELECT COUNT(*) FROM controller_team_role) AS role_team_assignment_count, (SELECT COUNT(*) FROM controller_role) AS total_roles;" \
+  <<< "SELECT (SELECT COUNT(*) FROM auth_user) AS total_users, (SELECT COUNT(*) FROM main_team) AS total_teams, (SELECT COUNT(*) FROM main_organization) AS total_organizations, (SELECT COUNT(*) FROM main_rbac_roles_members) AS role_user_assignment_count, (SELECT COUNT(*) FROM main_rbac_roles_parents p JOIN main_team t ON t.member_role_id = p.to_role_id WHERE p.from_role_id <> t.read_role_id) AS role_team_assignment_count, (SELECT COUNT(*) FROM main_rbac_roles) AS total_roles;" \
   > ./user-org-distribution.txt 2>/dev/null
 ```
 
@@ -278,7 +278,7 @@ All commands run from your **local machine**.
 ```bash
 oc exec $GATEWAY_POD -n $NAMESPACE -c $GATEWAY_CONTAINER -- \
   aap-gateway-manage dbshell \
-  <<< "SELECT schemaname, relname, n_live_tup, n_dead_tup, last_vacuum, last_analyze FROM pg_stat_user_tables WHERE schemaname = 'public' ORDER BY n_dead_tup DESC;" \
+  <<< "SELECT schemaname, relname, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze FROM pg_stat_user_tables WHERE schemaname = 'public' ORDER BY n_dead_tup DESC;" \
   > ~/aap-collection/bloat-gateway.txt 2>/dev/null
 ```
 
@@ -296,7 +296,7 @@ oc exec $GATEWAY_POD -n $NAMESPACE -c $GATEWAY_CONTAINER -- \
 ```bash
 oc exec $GATEWAY_POD -n $NAMESPACE -c $GATEWAY_CONTAINER -- \
   aap-gateway-manage dbshell \
-  <<< "SELECT (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY role_count) FROM (SELECT COUNT(DISTINCT rua.role_definition_id) as role_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS median_roles_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY role_count) FROM (SELECT COUNT(DISTINCT rua.role_definition_id) as role_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS p90_roles_per_org, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS median_users_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_organization o LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = o.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='organization') GROUP BY o.id) t) AS p90_users_per_org, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY team_count) FROM (SELECT COUNT(DISTINCT t.id) as team_count FROM aap_gateway_api_organization o LEFT JOIN aap_gateway_api_team t ON t.organization_id = o.id GROUP BY o.id) t) AS median_teams_per_org, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY team_count) FROM (SELECT COUNT(DISTINCT t.id) as team_count FROM aap_gateway_api_organization o LEFT JOIN aap_gateway_api_team t ON t.organization_id = o.id GROUP BY o.id) t) AS p90_teams_per_org, (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_team t LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = t.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='team') GROUP BY t.id) t2) AS median_users_per_team, (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY user_count) FROM (SELECT COUNT(DISTINCT rua.user_id) as user_count FROM aap_gateway_api_team t LEFT JOIN dab_rbac_roleuserassignment rua ON rua.object_id = t.id::text AND rua.content_type_id = (SELECT id FROM django_content_type WHERE app_label='aap_gateway_api' AND model='team') GROUP BY t.id) t2) AS p90_users_per_team;" \
+  <<< "WITH org_ct AS (SELECT id FROM dab_rbac_dabcontenttype WHERE app_label='aap_gateway_api' AND model='organization'), team_ct AS (SELECT id FROM dab_rbac_dabcontenttype WHERE app_label='aap_gateway_api' AND model='team'), org_assign AS (SELECT o.id AS org_id, rua.user_id, rua.role_definition_id FROM aap_gateway_api_organization o JOIN dab_rbac_roleuserassignment rua ON rua.content_type_id = (SELECT id FROM org_ct) AND rua.object_id = o.id::text UNION ALL SELECT o.id, rua.user_id, rua.role_definition_id FROM aap_gateway_api_organization o JOIN dab_rbac_objectrole r ON r.content_type_id = (SELECT id FROM org_ct) AND r.object_id = o.id::text JOIN dab_rbac_roleuserassignment rua ON rua.object_role_id = r.id), team_assign AS (SELECT t.id AS team_id, rua.user_id FROM aap_gateway_api_team t JOIN dab_rbac_roleuserassignment rua ON rua.content_type_id = (SELECT id FROM team_ct) AND rua.object_id = t.id::text UNION ALL SELECT t.id, rua.user_id FROM aap_gateway_api_team t JOIN dab_rbac_objectrole r ON r.content_type_id = (SELECT id FROM team_ct) AND r.object_id = t.id::text JOIN dab_rbac_roleuserassignment rua ON rua.object_role_id = r.id), org_stats AS (SELECT o.id, COALESCE(a.role_count, 0) AS role_count, COALESCE(a.user_count, 0) AS user_count, COALESCE(t.team_count, 0) AS team_count FROM aap_gateway_api_organization o LEFT JOIN (SELECT org_id, COUNT(DISTINCT role_definition_id) AS role_count, COUNT(DISTINCT user_id) AS user_count FROM org_assign GROUP BY org_id) a ON a.org_id = o.id LEFT JOIN (SELECT organization_id, COUNT(*) AS team_count FROM aap_gateway_api_team GROUP BY organization_id) t ON t.organization_id = o.id), team_stats AS (SELECT t.id, COALESCE(a.user_count, 0) AS user_count FROM aap_gateway_api_team t LEFT JOIN (SELECT team_id, COUNT(DISTINCT user_id) AS user_count FROM team_assign GROUP BY team_id) a ON a.team_id = t.id) SELECT (SELECT COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY role_count), 0) FROM org_stats) AS median_roles_per_org, (SELECT COALESCE(percentile_cont(0.9) WITHIN GROUP (ORDER BY role_count), 0) FROM org_stats) AS p90_roles_per_org, (SELECT COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY user_count), 0) FROM org_stats) AS median_users_per_org, (SELECT COALESCE(percentile_cont(0.9) WITHIN GROUP (ORDER BY user_count), 0) FROM org_stats) AS p90_users_per_org, (SELECT COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY team_count), 0) FROM org_stats) AS median_teams_per_org, (SELECT COALESCE(percentile_cont(0.9) WITHIN GROUP (ORDER BY team_count), 0) FROM org_stats) AS p90_teams_per_org, (SELECT COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY user_count), 0) FROM team_stats) AS median_users_per_team, (SELECT COALESCE(percentile_cont(0.9) WITHIN GROUP (ORDER BY user_count), 0) FROM team_stats) AS p90_users_per_team;" \
   > ~/aap-collection/gateway-distribution.txt 2>/dev/null
 ```
 
@@ -320,7 +320,7 @@ cd ~/aap-collection
 cat > metadata.txt <<EOF
 === AAP Scale Profile Metadata ===
 Collection Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-Cluster Name: $(oc config current-context)
+Cluster Name: $(oc whoami --show-server)
 OpenShift Version: $(oc version -o json | jq -r '.openshiftVersion')
 Node Count: $(oc get nodes --no-headers | wc -l)
 AAP Version: $(oc get aap -n $NAMESPACE -o jsonpath='{.items[0].status.version}')
@@ -331,6 +331,13 @@ AAP Namespace: $NAMESPACE
 EOF
 
 cat metadata.txt
+```
+
+On AAP 2.4, use these lines instead for the version and replicas, and omit Gateway Replicas:
+```bash
+AAP Version: $(oc get automationcontroller -n $NAMESPACE -o jsonpath='{.items[0].status.version}')
+Controller Task Replicas: $(oc get automationcontroller -n $NAMESPACE -o jsonpath='{.items[0].spec.task_replicas}')
+Controller Web Replicas: $(oc get automationcontroller -n $NAMESPACE -o jsonpath='{.items[0].spec.web_replicas}')
 ```
 
 ### Bundle Results
@@ -395,7 +402,7 @@ oc exec $CONTROLLER_POD -n $NAMESPACE -c $CONTROLLER_CONTAINER -- \
 ```
 
 If you used the correct variant and still see the error, contact your Red Hat support representative with:
-- Your AAP version: `oc get aap -n $NAMESPACE -o jsonpath='{.items[0].status.version}'`
+- Your AAP version: `oc get aap -n $NAMESPACE -o jsonpath='{.items[0].status.version}'` (AAP 2.4: `oc get automationcontroller -n $NAMESPACE -o jsonpath='{.items[0].status.version}'`)
 - The full error message
 - Which command number failed (Command 1-9 for Controller, 1-3 for Gateway)
 
